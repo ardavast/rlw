@@ -9,6 +9,8 @@
 #include <sys/bus.h> 
 #include <sys/rman.h>
 #include <sys/socket.h>
+#include <sys/sockio.h>
+#include <sys/queue.h>
 
 #include <machine/bus.h>
 #include <machine/resource.h>
@@ -16,6 +18,7 @@
 #include <net/if.h>
 #include <net/if_media.h>
 #include <net/if_types.h>
+#include <net/ethernet.h>
 
 #include <net80211/ieee80211_var.h>
 #include <net80211/ieee80211_regdomain.h>
@@ -33,8 +36,22 @@ static void rlw_reset(struct rlw_softc *);
 
 static void rlw_read_eeprom(struct rlw_softc *, caddr_t, int, int);
 
-static void rlw_init(void *);
-static int rlw_ioctl(struct ifnet *, u_long, caddr_t);
+static void rlw_tx_enable(struct rlw_softc *sc);
+static void rlw_rx_enable(struct rlw_softc *sc);
+
+static int  rlw_alloc_data_list(struct rlw_softc *sc, struct rlw_data data[] ,int ndata, int maxsz, void *dma_buf);
+static void rlw_free_data_list(struct rlw_softc *sc, struct rlw_data data[], int ndata, int fillmbuf);
+static int  rlw_alloc_tx_data_list(struct rlw_softc *sc);
+static int  rlw_alloc_rx_data_list(struct rlw_softc *sc);
+
+static void rlw_init(void *arg);
+static void rlw_init_locked(void *arg);
+static void rlw_stop(struct ifnet *);
+static void rlw_stop_locked(struct ifnet *);
+
+static void rlw_set_multi(void *arg);
+
+static int  rlw_ioctl(struct ifnet *, u_long, caddr_t);
 static void rlw_start(struct ifnet *);
 
 static int
@@ -125,14 +142,14 @@ rlw_attach(device_t dev)
     device_printf(dev, "cck chan %d = %x\n", i + 1, sc->rlw_txpwr_cck[i + 1]);
   }
 
-  for (i = 0; i < 14; i += 2) {
+/*  for (i = 0; i < 14; i += 2) {
     uint16_t txpwr;
     rlw_read_eeprom(sc, (caddr_t)&txpwr, 0x20 + (i >> 1), 1);
-    sc->rlw_txpwr_ofdm[i] = (txpwr & 0xFF) << 8;
-    sc->rlw_txpwr_ofdm[i + 1] = txpwr & 0xFF00;
+    sc->rlw_txpwr_ofdm[i] = txpwr & 0xFF;
+    sc->rlw_txpwr_ofdm[i + 1] = txpwr >> 8;
     device_printf(dev, "ofdm chan %d = %x\n", i, sc->rlw_txpwr_ofdm[i]);
     device_printf(dev, "ofdm chan %d = %x\n", i + 1, sc->rlw_txpwr_ofdm[i + 1]);
-  }
+  } */
 
   ifp = sc->rlw_ifp = if_alloc(IFT_IEEE80211);
   if (ifp == NULL) {
@@ -153,15 +170,15 @@ rlw_attach(device_t dev)
 
   ic = ifp->if_l2com;
   ic->ic_ifp = ifp;
-  ic->ic_phytype = IEEE80211_T_OFDM;      /* not only, but not used */
-  ic->ic_opmode = IEEE80211_M_STA;        /* default to BSS mode */
-  
-  /* set device capabilities */
-  ic->ic_caps = IEEE80211_C_STA | IEEE80211_C_MONITOR;
+  ic->ic_phytype = IEEE80211_T_OFDM;
+  ic->ic_opmode = IEEE80211_M_STA;
+  ic->ic_caps = IEEE80211_C_STA;
 
   setbit(&bands, IEEE80211_MODE_11B);
   setbit(&bands, IEEE80211_MODE_11G);
   ieee80211_init_channels(ic, NULL, &bands);
+
+  ieee80211_ifattach(ic, sc->rlw_bssid);
 
 fail1: /* unlock */
 fail:
@@ -259,17 +276,293 @@ rlw_read_eeprom(struct rlw_softc *sc, caddr_t dest, int off, int cnt)
 static void
 rlw_init(void *arg)
 {
+  struct rlw_softc *sc = arg;
+
+  RLW_LOCK(sc);
+  rlw_init_locked(sc);
+  RLW_UNLOCK(sc);
+}
+
+static void
+rlw_init_locked(void *arg)
+{
+  struct rlw_softc *sc = arg;
+  struct ifnet *ifp = sc->rlw_ifp;
+  int ret;
+
+  if (ifp->if_drv_flags & IFF_DRV_RUNNING)
+    rlw_stop_locked(ifp);
+
+  rlw_adapter_start(sc);
+  if (error != 0)
+    goto fail;
+
+  sc->rlw_txtimer = 0;
+
+  if (!(sc->rlw_flags & RLW_INIT_ONCE)) {
+          ret = rlw_alloc_rx_data_list(sc);
+          if (ret != 0)
+                  goto fail;
+          ret = rlw_alloc_tx_data_list(sc);
+          if (ret != 0)
+                  goto fail;
+          sc->rlw_flags |= RLW_INIT_ONCE;
+  }
+
+  rlw_rx_enable(sc);
+  rlw_tx_enable(sc);
+
+  ifp->if_drv_flags &= ~IFF_DRV_OACTIVE;
+  ifp->if_drv_flags |= IFF_DRV_RUNNING;
+
+fail:
+  return;
+}
+
+
+static int
+rlw_alloc_data_list(struct rlw_softc *sc, struct rlw_data data[] ,int ndata, int maxsz, void *dma_buf)
+{
+  int i, error;
+
+  for (i = 0; i < ndata; i++) {
+    struct rlw_data *dp = &data[i];
+    dp->sc = sc;
+
+    if (dma_buf == NULL) {
+      dp->m = m_getcl(M_NOWAIT, MT_DATA, M_PKTHDR);
+      if (dp->m == NULL) {
+        device_printf(sc->rlw_dev, "could not allocate rx mbuf\n");
+        error = ENOMEM;
+        goto fail;
+      }
+      dp->buf = mtod(dp->m, uint8_t *);
+    } else {
+      dp->m = NULL;
+      dp->buf = ((uint8_t *)dma_buf) + (i * maxsz);
+    }
+    dp->ni = NULL;
+  }
+
+  return (0);
+
+fail:
+  rlw_free_data_list(sc, data, ndata, 1);
+  return (error);
+}
+
+static void
+rlw_free_data_list(struct rlw_softc *sc, struct rlw_data data[], int ndata, int fillmbuf)
+{
+  int i;
+
+  for (i = 0; i < ndata; i++) {
+    struct rlw_data *dp = &data[i];
+
+    if (fillmbuf == 1) {
+      if (dp->m != NULL) {
+        m_freem(dp->m);
+        dp->m = NULL;
+        dp->buf = NULL;
+      }
+    } else {
+      dp->buf = NULL;
+    }
+    if (dp->ni != NULL) {
+      ieee80211_free_node(dp->ni);
+      dp->ni = NULL;
+    }
+  }
+}
+
+static int
+rlw_alloc_tx_data_list(struct rlw_softc *sc)
+{
+  int error, i;
+
+  error = rlw_alloc_data_list(sc, sc->rlw_tx, RLW_TX_DATA_LIST_COUNT, RLW_TX_MAXSIZE, sc->rlw_tx_dma_buf);
+  if (error != 0)
+    return (error);
+
+  STAILQ_INIT(&sc->rlw_tx_active);
+  STAILQ_INIT(&sc->rlw_tx_inactive);
+  STAILQ_INIT(&sc->rlw_tx_pending);
+
+  for (i = 0; i < RLW_TX_DATA_LIST_COUNT; i++)
+    STAILQ_INSERT_HEAD(&sc->rlw_tx_inactive, &sc->rlw_tx[i], next);
+
+  return (0);
+}
+
+static int
+rlw_alloc_rx_data_list(struct rlw_softc *sc)
+{
+  int error, i;
+
+  error = rlw_alloc_data_list(sc, sc->rlw_rx, RLW_RX_DATA_LIST_COUNT, MCLBYTES, NULL);
+  if (error != 0)
+    return (error);
+
+  STAILQ_INIT(&sc->rlw_rx_active);
+  STAILQ_INIT(&sc->rlw_rx_inactive);
+
+  for (i = 0; i < RLW_RX_DATA_LIST_COUNT; i++)
+    STAILQ_INSERT_HEAD(&sc->rlw_rx_inactive, &sc->rlw_rx[i], next);
+
+  return (0);
 }
 
 static int
 rlw_ioctl(struct ifnet *ifp, u_long cmd, caddr_t data)
 {
-  return (0);
+  struct rlw_softc *sc = ifp->if_softc;
+  struct ieee80211com *ic = ifp->if_l2com;
+  struct ifreq *ifr = (struct ifreq *)data;
+  int error = 0;
+  int startall = 0;
+
+  RLW_LOCK(sc);
+  error = (sc->sc_flags & RLW_DETACHED) ? ENXIO : 0;
+  RLW_UNLOCK(sc);
+  if (error)
+    return (error);
+
+  switch (cmd) {
+  case SIOCSIFFLAGS:
+    if (ifp->if_flags & IFF_UP) {
+      if (ifp->if_drv_flags & IFF_DRV_RUNNING) {
+        if ((ifp->if_flags ^ sc->rlw_if_flags) & (IFF_ALLMULTI | IFF_PROMISC))
+           rlw_set_multi(sc);
+      } else {
+        rlw_init(ifp->if_softc);
+        startall = 1;
+        (void)1;
+      }
+    } else {
+      if (ifp->if_drv_flags & IFF_DRV_RUNNING)
+        rlw_stop(ifp);
+        (void)1;
+    }
+
+    sc->rlw_if_flags = ifp->if_flags;
+
+    if (startall)
+      ieee80211_start_all(ic);
+    break;
+  case SIOCGIFMEDIA:
+    error = ifmedia_ioctl(ifp, ifr, &ic->ic_media, cmd);
+    break;
+  case SIOCGIFADDR:
+    error = ether_ioctl(ifp, cmd, data);
+    break;
+  default:
+    error = EINVAL;
+    break;
+  }
+
+  return (error);
+}
+
+static void
+rlw_tx_enable(struct rlw_softc *sc)
+{
+  uint8_t reg;
+
+  reg = CSR_READ_1(sc, RLW_CW_CONF);
+  reg &= ~RLW_CW_CONF_PERPACKET_CW;
+  reg |= RLW_CW_CONF_PERPACKET_RETRY;
+  CSR_WRITE_1(sc, RLW_CW_CONF, reg);
+
+  reg = CSR_READ_1(sc, RLW_TX_AGC_CTL);
+  reg &= ~RLW_TX_AGC_CTL_PERPACKET_GAIN;
+  reg &= ~RLW_TX_AGC_CTL_PERPACKET_ANTSEL;
+  reg |= ~RLW_TX_AGC_CTL_FEEDBACK_ANT;
+  CSR_WRITE_1(sc, RLW_TX_AGC_CTL, reg);
+
+  reg = CSR_READ_1(sc, RLW_CR);
+  reg |= RLW_CR_TE;
+  CSR_WRITE_1(sc, RLW_CR, reg);
+}
+
+static void
+rlw_rx_enable(struct rlw_softc *sc)
+{
+  uint32_t reg;
+
+  reg = CSR_READ_4(sc, RLW_RCR);
+  reg &= ~RLW_RCR_RXFTH_MASK;
+  reg &= ~RLW_RCR_MXDMA_MASK;
+  reg |= (RLW_RCR_ONLYERLPKT
+        | RLW_RCR_ENMARP
+        | RLW_RCR_CBSSID
+        | RLW_RCR_AMF
+        | RLW_RCR_ADF
+        | RLW_RCR_RXFTH_NONE
+        | RLW_RCR_MXDMA_UNLIM
+        | RLW_RCR_AB
+        | RLW_RCR_APM);
+
+
+  CSR_WRITE_4(sc, RLW_RCR, reg);
 }
 
 static void
 rlw_start(struct ifnet *ifp)
 {
+}
+
+
+static void
+rlw_stop(struct ifnet *ifp)
+{
+  struct rlw_softc *sc = ifp->rlw_softc;
+  RLW_LOCK(sc);
+  rlw_stop_locked(ifp);
+  RLW_UNLOCK(sc);
+}
+
+static void
+rlw_stop_locked(struct ifnet *ifp)
+{
+  struct rlw_softc *sc = ifp->if_softc;
+  uint8_t reg;
+
+  ifp->if_drv_flags &= ~(IFF_DRV_RUNNING | IFF_DRV_OACTIVE);
+  CSR_WRITE_2(sc, RLW_IMR, 0xffff);
+
+  reg = CSR_READ_1(sc, RLW_CMD, 0xffff);
+  reg &= ~(URTW_CMD_RX_ENABLE | URTW_CMD_TX_ENABLE);
+  urtw_write8_m(sc, URTW_CMD, data8);
+
+  error = sc->sc_rf_stop(sc);
+  if (error != 0)
+    goto fail;
+  error = urtw_set_mode(sc, URTW_EPROM_CMD_CONFIG);
+  if (error)
+    goto fail;
+  urtw_read8_m(sc, URTW_CONFIG4, &data8);
+  urtw_write8_m(sc, URTW_CONFIG4, data8 | URTW_CONFIG4_VCOOFF);
+  error = urtw_set_mode(sc, URTW_EPROM_CMD_NORMAL);
+  if (error)
+    goto fail;
+fail:
+  if (error)
+    device_printf(sc->sc_dev, "failed to stop (%s)\n", usbd_errstr(error));
+
+  callout_stop(&sc->sc_watchdog_ch);
+  urtw_abort_xfers(sc);
+}
+
+static void
+rlw_set_multi(void *arg)
+{
+  struct rlw_softc *sc = arg;
+  struct ifnet *ifp = sc->sc_ifp;
+
+  if (!(ifp->if_flags & IFF_UP))
+    return;
+
+  ifp->if_flags |= IFF_ALLMULTI;
 }
 
 static int
